@@ -8,215 +8,279 @@ Built on **Salesforce CPQ (Revenue Cloud), package version 262.0**, using Apex, 
 
 ## Table of Contents
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Excel Template Format](#excel-template-format)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Deployment](#deployment)
-- [Usage](#usage)
-- [Testing](#testing)
-- [Known Platform Constraints](#known-platform-constraints)
-- [Documentation](#documentation)
-- [Author](#author)
+* [Features](#features)
+* [Architecture](#architecture)
+* [Excel Template Format](#excel-template-format)
+* [Project Structure](#project-structure)
+* [Prerequisites](#prerequisites)
+* [Deployment](#deployment)
+* [Usage](#usage)
+* [Testing](#testing)
+* [Known Platform Constraints](#known-platform-constraints)
+* [Documentation](#documentation)
+* [Author](#author)
 
 ---
 
-## Features
+# Features
 
-- **Excel upload and parsing** via a custom Lightning Web Component (client-side parsing with SheetJS)
-- **Two-step validation** — preview validation errors before anything is written to the database, then confirm to proceed
-- **Automatic grouping** of Excel rows into Quotes by Quote Number, each with multiple Quote Lines
-- **Find-or-create logic** for Accounts and Opportunities, deduplicated both against existing org data and within the same upload batch
-- **Real Salesforce CPQ pricing** — Quote Lines are added through CPQ's own `ServiceRouter` API (Read → ProductLoader → ProductAdder → Calculator → Saver), not raw `insert`, so CPQ's pricing engine, discounts, and product rules apply exactly as they would from the CPQ Line Editor
-- **Skip-invalid, continue-processing** — one bad row or one failed Quote never blocks the rest of the batch
-- **Fully asynchronous** — two-phase Queueable chain (header creation, then per-Quote CPQ processing) so the UI is never blocked
-- **Bulkified and governor-limit compliant** — verified at 110 Quotes / 218 Quote Lines in a single upload
-- **Live processing summary** — Total / Successful / Failed Quotes and Total Quote Lines, updating in real time as the batch processes
-- **Downloadable error report (CSV)** — per-row and per-Quote failure details
-- **Original Excel file stored** against the processing record
-- **Processing History screen** — browse and re-open every past upload run
-- **Resilient to page refresh** — resumes watching an in-progress run after a reload or browser restart
+* **Excel upload and parsing** via a custom Lightning Web Component (client-side parsing with SheetJS)
+* **Two-step validation** — preview validation errors before anything is written to the database, then confirm to proceed
+* **Automatic grouping** of Excel rows into Quotes by Quote Number, each with multiple Quote Lines
+* **Find-or-create logic** for Accounts and Opportunities, deduplicated against existing org data and within the same upload batch
+* **Real Salesforce CPQ pricing** — Quote Lines are created through CPQ's `SBQQ.ServiceRouter` API instead of direct DML, allowing CPQ pricing rules, discounts, and product rules to execute normally
+* **Skip-invalid, continue-processing** — invalid rows and failed Quotes are logged without stopping the complete upload
+* **Fully asynchronous processing** using chained Queueable jobs
+* **Bulkified and governor-limit compliant** — tested with 110 Quotes and 218 Quote Lines in a single upload
+* **Live processing summary** — displays Total, Successful, Failed Quotes and Quote Line progress
+* **Downloadable CSV error report**
+* **Original Excel file storage** against the upload process record
+* **Processing History screen** to view previous uploads
+* **Resilient after page refresh** — users can continue monitoring running processes
 
 ---
 
-## Architecture
+# Architecture
 
 ```
 LWC (quoteBulkUpload)
-   |  previewValidation()  -- read-only, no DML
+   |
+   | previewValidation()
+   | (No database changes)
    v
 QuoteBulkUploadController.previewValidation()
+   |
    -> QuoteValidationService.validate()
 
-LWC -- user confirms --
-   |  submitForProcessing()
-   v
-QuoteBulkUploadController.submitForProcessing()
-   -> QuoteValidationService.validate()          (re-validate)
-   -> QuoteGroupingService.groupByQuoteNumber()
-   -> UploadProcessService.createProcess()       (Upload_Process__c, Status = Pending)
-   -> UploadErrorService.logRowErrors()          (row-level validation failures)
-   -> enqueueJob(QuoteUploadQueueable)            [Phase 1]
 
-QuoteUploadQueueable.execute()                   [Phase 1: header records]
+User Confirmation
+   |
+   v
+
+QuoteBulkUploadController.submitForProcessing()
+   |
+   -> QuoteValidationService.validate()
+   -> QuoteGroupingService.groupByQuoteNumber()
+   -> UploadProcessService.createProcess()
+   -> UploadErrorService.logRowErrors()
+   -> QuoteUploadQueueable
+
+
+QuoteUploadQueueable
+(Phase 1: Create Header Records)
+
    -> AccountService.getOrCreateAccounts()
    -> OpportunityService.createOpportunities()
-   -> bulk Database.insert(SBQQ__Quote__c[])
-   -> enqueueJob(QuoteLineProcessingQueueable)    [Phase 2, one hop per Quote]
+   -> Create SBQQ__Quote__c records
+   -> Start Quote Line Processing
 
-QuoteLineProcessingQueueable.execute()            [Phase 2a: calculate + save lines]
-   -> CPQProductAdderService.calculateAndSaveLines()
-        -> SBQQ.ServiceRouter (QuoteReader / ProductLoader / QuoteProductAdder / QuoteCalculator)
-        -> CPQQuoteCalculatorCallback.callback() -> QuoteSaver
-   -> enqueueJob(QuoteLineCorrectionQueueable)    [next hop]
 
-QuoteLineCorrectionQueueable.execute()            [Phase 2b: qty/price correction]
-   -> CPQProductAdderService.correctQuantitiesAndPrices()
-   -> enqueueJob(QuoteLineProcessingQueueable)    [next Quote, or complete]
+QuoteLineProcessingQueueable
+(Phase 2: CPQ Processing)
 
-(fallback only, Developer/Trial orgs — see Known Platform Constraints)
-QuoteLineChainResetScheduler
-   -> re-enqueues whichever Queueable was about to run, from a fresh async context
+   -> CPQProductAdderService
+        |
+        -> SBQQ.ServiceRouter
+            - QuoteReader
+            - ProductLoader
+            - QuoteProductAdder
+            - QuoteCalculator
+            - QuoteSaver
+
+
+QuoteLineCorrectionQueueable
+
+   -> Correct Quantity / Price values
+   -> Continue next Quote processing
 ```
 
-The full design rationale — including several Salesforce CPQ platform behaviors discovered during implementation — is documented in the [Technical Design Document](#documentation).
+Complete design details are available in the Technical Design Document:
+
+[📄 Technical Design Document](./docs/Technical_Design_Document.docx)
 
 ---
 
-## Excel Template Format
+# Excel Template Format
 
-One row per Quote Line; rows sharing the same **Quote Number** are grouped into a single Quote with multiple Quote Lines.
+One row represents one Quote Line. Rows having the same **Quote Number** are grouped into one Quote.
 
-| Column | Maps To | Notes |
-|---|---|---|
-| Quote Number | Quote grouping key | Required |
-| Customer Name | Account.Name | Matched or created |
-| Opportunity Name | Opportunity.Name | Matched (per Account) or created |
-| Quote Name | External_Quote_Name__c | |
-| Product Name | Product2.Name | Must exist, be active, and have a Standard Pricebook Entry |
-| Quantity | Quote Line quantity | Must be > 0 |
-| Sales Price | Quote Line net price | Applied only if the product allows price editing |
-| Quote Start Date | Quote start date | |
-| Quote End Date | Quote end date | |
-| Notes | Quote notes | |
+| Column           | Maps To             | Notes                            |
+| ---------------- | ------------------- | -------------------------------- |
+| Quote Number     | Quote grouping key  | Required                         |
+| Customer Name    | Account.Name        | Matched or created               |
+| Opportunity Name | Opportunity.Name    | Matched or created               |
+| Quote Name       | External Quote Name |                                  |
+| Product Name     | Product2.Name       | Product must exist and be active |
+| Quantity         | Quote Line Quantity | Must be greater than 0           |
+| Sales Price      | Quote Line Price    | Applied based on CPQ rules       |
+| Quote Start Date | Quote Start Date    |                                  |
+| Quote End Date   | Quote End Date      |                                  |
+| Notes            | Quote Notes         |                                  |
 
-A sample template is included at [`/data/QuoteUploadTemplate.xlsx`](./data/QuoteUploadTemplate.xlsx).
+Sample upload template:
+
+[📊 QuoteUploadTemplate.xlsx](./docs/QuoteUploadTemplate.xlsx)
 
 ---
 
-## Project Structure
+# Project Structure
 
 ```
 force-app/main/default/
+
 ├── classes/
-│   ├── QuoteBulkUploadController.cls        # LWC entry point (validate, submit, poll, history, file storage)
-│   ├── QuoteValidationService.cls           # Row-level validation
-│   ├── QuoteGroupingService.cls             # Groups rows into per-Quote bundles
-│   ├── AccountService.cls                   # Find-or-create Accounts
-│   ├── OpportunityService.cls               # Find-or-create Opportunities
-│   ├── QuoteUploadQueueable.cls             # Phase 1: header record creation
-│   ├── QuoteLineProcessingQueueable.cls     # Phase 2a: calculate + save Quote Lines
-│   ├── QuoteLineCorrectionQueueable.cls     # Phase 2b: quantity/price correction
-│   ├── QuoteLineChainResetScheduler.cls     # Chain-depth fallback (Dev/Trial orgs)
-│   ├── CPQProductAdderService.cls           # SBQQ.ServiceRouter integration
-│   ├── CPQQuoteCalculatorCallback.cls       # SBQQ.CalculateCallback implementation
-│   ├── UploadProcessService.cls             # Upload_Process__c status/progress management
-│   ├── UploadErrorService.cls               # Upload_Error__c logging
-│   ├── ExcelRowWrapper.cls / QuoteGroupWrapper.cls / QuoteUploadResponse.cls / RowError.cls
-│   └── *Test.cls                            # Unit tests
+│
+│   ├── QuoteBulkUploadController.cls
+│   ├── QuoteValidationService.cls
+│   ├── QuoteGroupingService.cls
+│   ├── AccountService.cls
+│   ├── OpportunityService.cls
+│   ├── QuoteUploadQueueable.cls
+│   ├── QuoteLineProcessingQueueable.cls
+│   ├── QuoteLineCorrectionQueueable.cls
+│   ├── CPQProductAdderService.cls
+│   ├── CPQQuoteCalculatorCallback.cls
+│   ├── UploadProcessService.cls
+│   ├── UploadErrorService.cls
+│   └── Test Classes
+│
 ├── lwc/
-│   ├── quoteBulkUpload/                     # Main upload, validation, and results screen
-│   └── uploadProcessingHistory/             # Processing history screen
+│
+│   ├── quoteBulkUpload/
+│   └── uploadProcessingHistory/
+│
 └── objects/
-    ├── Upload_Process__c/                   # Tracks one upload run
-    └── Upload_Error__c/                     # Row/Quote-level failure detail (Master-Detail to Upload_Process__c)
+
+    ├── Upload_Process__c
+    └── Upload_Error__c
 ```
 
 ---
 
-## Prerequisites
+# Prerequisites
 
-- A Salesforce org with **Salesforce CPQ** (managed package, namespace `SBQQ`) installed
-- The running user must have:
-  - The **Salesforce CPQ** Permission Set License assigned
-  - The **SBQQ User** permission set assigned
-- CPQ **Package Settings** must have been saved at least once (Setup → Installed Packages → Salesforce CPQ → Configure → save any tab) to initialize the `SBQQ__Setup__c` configuration record
-- If **"Use Integration User for Calculations"** is enabled under CPQ Package Settings → Pricing and Calculation, click **Generate Integration User Permissions** once
-- Salesforce CLI (`sf`) installed for deployment
+Before deployment:
 
----
+* Salesforce Org with **Salesforce CPQ installed**
+* CPQ package namespace: `SBQQ`
+* Salesforce CPQ Permission Set License assigned
+* SBQQ User permission set assigned
+* Salesforce CLI installed
 
-## Deployment
+CPQ configuration requirements:
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/<your-username>/<your-repo>.git
-   cd <your-repo>
-   ```
+* CPQ Package Settings should be initialized
+* If "Use Integration User for Calculations" is enabled:
 
-2. Authorize your org:
-   ```bash
-   sf org login web --alias myOrg
-   ```
-
-3. Create the two custom objects (`Upload_Process__c`, `Upload_Error__c`) and the two custom fields on `SBQQ__Quote__c` (`Excel_Quote_Number__c`, `External_Quote_Name__c`) if they aren't already present in your org — see the [Technical Design Document](#documentation) for the full field list.
-
-4. Deploy the source:
-   ```bash
-   sf project deploy start --target-org myOrg
-   ```
-
-5. Add the `quoteBulkUpload` and `uploadProcessingHistory` components to a Lightning App Page, Home Page, or Tab via **Lightning App Builder** — they are not auto-exposed anywhere by default.
-
-6. (Optional) Add the **Files** related list to the `Upload_Process__c` page layout to make stored Excel files easier to browse — they're also reachable via the standard Notes & Attachments related list without this step.
+  * Generate Integration User Permissions
 
 ---
 
-## Usage
+# Deployment
 
-1. Open the Quote Bulk Upload screen and select an `.xlsx` file matching the template format.
-2. Click **Validate** — review any row-level errors before proceeding. No data is written yet at this point.
-3. Click **Proceed with Processing** to confirm. Processing runs asynchronously in the background.
-4. Watch the live progress panel, or navigate away and come back later — the run resumes tracking automatically.
-5. Download the error report if any rows or Quotes failed.
-6. Use the **Processing History** screen to review or re-check any past upload.
+### 1. Clone Repository
+
+```bash
+git clone https://github.com/<your-username>/<your-repo>.git
+
+cd <your-repo>
+```
+
+### 2. Authorize Salesforce Org
+
+```bash
+sf org login web --alias myOrg
+```
+
+### 3. Deploy Source
+
+```bash
+sf project deploy start --target-org myOrg
+```
+
+### 4. Configure Lightning Components
+
+Add these components using Lightning App Builder:
+
+* `quoteBulkUpload`
+* `uploadProcessingHistory`
+
+Available locations:
+
+* Lightning App Page
+* Home Page
+* Custom Tab
 
 ---
 
-## Testing
+# Usage
 
-Run the full test suite:
+1. Open the Bulk Quote Upload page.
+2. Select an Excel file following the provided template.
+3. Click **Validate**.
+4. Review validation errors.
+5. Click **Proceed with Processing**.
+6. Background Queueable jobs process Accounts, Opportunities, Quotes, and Quote Lines.
+7. Monitor progress from the processing screen.
+8. Download error reports if required.
+
+---
+
+# Testing
+
+Run Apex tests:
 
 ```bash
 sf apex run test --target-org myOrg --code-coverage --result-format human
 ```
 
-Test coverage target: **>90%** org-wide, per the project requirements.
+Expected coverage:
+
+```
+>90%
+```
 
 ---
 
-## Known Platform Constraints
+# Known Platform Constraints
 
-A few Salesforce CPQ / Apex platform behaviors materially shaped this design — full detail is in the TDD, summarized here:
+Important Salesforce CPQ behaviors considered during implementation:
 
-- **`SBQQ.QuoteAPI.QuoteCalculator` requires a `{quote, callbackClass}` context object**, not a raw quote model, and the named callback class must implement `SBQQ.CalculateCallback`.
-- **`SBQQ.QuoteAPI.QuoteProductAdder` must receive all products to add in a single call** — calling it once per product and threading the result through a loop silently loses earlier lines.
-- **CPQ's own `SBQQ__QuoteLine__c` trigger reacts to manual Quote Line updates** made outside the CPQ Line Editor; `SBQQ.TriggerControl.disable()/enable()` is used around the quantity/price correction step to prevent this.
-- **A Quote cannot reliably be calculated in the same transaction it was inserted in** — this is why record creation (Phase 1) and CPQ processing (Phase 2) run in separate, chained Queueable transactions.
-- **Queueable chain depth is capped at 5 in Developer Edition and Trial orgs only** (no cap in Production/Sandbox) — `QuoteLineChainResetScheduler` exists specifically as a fallback for this and is expected to be inert outside Developer/Trial orgs.
-- **Batch Apex is not used** — CPQ's internal trigger logic calls `AsyncInfo.hasMaxStackDepth()`, which is only valid inside a Queueable or Finalizer execution context.
-
----
-
-## Documentation
-
-- **Technical Design Document** — full architecture, requirements traceability, and platform-constraint writeups: [`/docs/Technical_Design_Document.docx`](./docs/Technical_Design_Document.docx)
-- **Demo Video** — [link here]
-- **Sample Excel Template** — [`/data/QuoteUploadTemplate.xlsx`](./data/QuoteUploadTemplate.xlsx)
+* `SBQQ.QuoteAPI.QuoteCalculator` requires quote and callback context.
+* `SBQQ.QuoteProductAdder` requires bulk product processing.
+* CPQ triggers require controlled updates when correcting Quote Lines.
+* Quote calculation is executed in separate transactions because CPQ calculation cannot reliably happen immediately after Quote creation.
+* Queueable processing is used instead of Batch Apex because CPQ internally depends on Queueable execution context.
 
 ---
 
-## Author
+# Documentation
+
+Additional project documents:
+
+### Technical Design Document
+
+Contains:
+
+* Complete architecture explanation
+* Requirements traceability
+* Salesforce CPQ implementation details
+* Platform limitations and solutions
+
+[📄 Technical_Design_Document.docx](./docs/Technical_Design_Document.docx)
+
+### Sample Excel Template
+
+Upload format example:
+
+[📊 QuoteUploadTemplate.xlsx](./docs/QuoteUploadTemplate.xlsx)
+
+### Demo Video
+
+[🎥 Demo Video Link](#)
+
+---
+
+# Author
 
 **Shashank**
