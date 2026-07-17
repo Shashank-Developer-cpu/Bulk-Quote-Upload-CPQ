@@ -1,0 +1,31 @@
+<template>
+    <lightning-card title="Quote Upload - Processing History" icon-name="standard:list_email">
+        <lightning-button slot="actions" label="Refresh" onclick={handleRefresh}></lightning-button>
+
+        <div class="slds-p-around_medium">
+            <template if:true={isLoading}>
+                <lightning-spinner alternative-text="Loading" size="small"></lightning-spinner>
+            </template>
+
+            <template if:true={isDownloading}>
+                <lightning-spinner alternative-text="Preparing download" size="small"></lightning-spinner>
+            </template>
+
+            <template if:true={hasRecords}>
+                <lightning-datatable
+                    key-field="Id"
+                    data={records}
+                    columns={columns}
+                    onrowaction={handleRowAction}
+                    hide-checkbox-column>
+                </lightning-datatable>
+            </template>
+
+            <template if:false={hasRecords}>
+                <template if:false={isLoading}>
+                    <p class="slds-p-around_small">No upload processes found yet.</p>
+                </template>
+            </template>
+        </div>
+    </lightning-card>
+</template>

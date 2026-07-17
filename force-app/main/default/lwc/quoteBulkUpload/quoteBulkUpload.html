@@ -1,0 +1,201 @@
+<template>
+
+    <lightning-card title="Bulk Quote Upload" icon-name="standard:quotes">
+
+        <template if:true={isResuming}>
+            <div class="slds-p-around_medium slds-align_absolute-center">
+                <lightning-spinner alternative-text="Resuming previous upload" size="small"></lightning-spinner>
+            </div>
+        </template>
+
+        <div class="slds-p-around_medium">
+
+            <lightning-input
+                type="file"
+                label="Upload Excel"
+                accept=".xlsx,.xls"
+                onchange={handleFileChange}>
+            </lightning-input>
+
+        </div>
+
+        <template if:true={excelData.length}>
+
+            <div class="slds-p-around_medium">
+
+                <lightning-datatable
+                    key-field="id"
+                    data={excelData}
+                    columns={columns}
+                    hide-checkbox-column>
+                </lightning-datatable>
+
+            </div>
+
+        </template>
+
+        <div class="slds-p-around_medium">
+            <lightning-button
+                label="Validate"
+                variant="brand"
+                disabled={isValidating}
+                onclick={validateExcel}>
+            </lightning-button>
+        </div>
+
+        <template if:true={isValidating}>
+            <div class="slds-p-around_medium slds-align_absolute-center">
+                <lightning-spinner alternative-text="Validating" size="small"></lightning-spinner>
+            </div>
+        </template>
+
+        <!-- Validation summary + row-level errors - shown before any processing starts -->
+        <template if:true={validationResponse}>
+            <div class="slds-p-around_medium slds-border_top">
+
+                <h3 class="slds-text-heading_small slds-m-bottom_small">Validation Results</h3>
+
+                <lightning-layout multiple-rows="true" class="slds-m-bottom_small">
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium">{validationResponse.totalRows}</p>
+                            <p class="slds-text-body_small">Total Rows</p>
+                        </div>
+                    </lightning-layout-item>
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium slds-text-color_success">{validationResponse.validRows}</p>
+                            <p class="slds-text-body_small">Valid Rows</p>
+                        </div>
+                    </lightning-layout-item>
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium slds-text-color_error">{validationResponse.invalidRows}</p>
+                            <p class="slds-text-body_small">Invalid Rows</p>
+                        </div>
+                    </lightning-layout-item>
+                </lightning-layout>
+
+                <template if:true={hasValidationErrors}>
+                    <div class="slds-scrollable_y" style="max-height: 240px;">
+                        <ul class="slds-list_vertical">
+                            <template for:each={validationErrorRows} for:item="err">
+                                <li key={err.key} class="slds-text-color_error slds-p-vertical_xx-small">
+                                    {err.message}
+                                </li>
+                            </template>
+                        </ul>
+                    </div>
+                </template>
+
+                <!-- Confirmation step - processing has NOT started yet at this point -->
+                <template if:true={canProceedToProcessing}>
+                    <div class="slds-box slds-theme_shade slds-m-top_medium">
+                        <p class="slds-m-bottom_small">
+                            Ready to process <strong>{validationResponse.validRows}</strong> valid row(s)
+                            <template if:true={hasValidationErrors}>
+                                (<strong>{validationResponse.invalidRows}</strong> invalid row(s) will be skipped)
+                            </template>.
+                            This will create Accounts, Opportunities, Quotes, and Quote Lines. Continue?
+                        </p>
+                        <lightning-button
+                            label="Proceed with Processing"
+                            variant="brand"
+                            disabled={isSubmitting}
+                            onclick={confirmProcessing}
+                            class="slds-m-right_small">
+                        </lightning-button>
+                        <lightning-button
+                            label="Cancel"
+                            variant="neutral"
+                            disabled={isSubmitting}
+                            onclick={cancelProcessing}>
+                        </lightning-button>
+                    </div>
+                </template>
+
+                <template if:true={noValidRows}>
+                    <p class="slds-text-color_error slds-m-top_small">
+                        No valid rows to process - nothing was submitted.
+                    </p>
+                </template>
+            </div>
+        </template>
+
+        <template if:true={isSubmitting}>
+            <div class="slds-p-around_medium slds-align_absolute-center">
+                <lightning-spinner alternative-text="Submitting" size="small"></lightning-spinner>
+            </div>
+        </template>
+
+        <!-- Live processing summary - polled while Status is Pending/Processing -->
+        <template if:true={processStatus}>
+            <div class="slds-p-around_medium slds-border_top">
+
+                <h3 class="slds-text-heading_small slds-m-bottom_small">
+                    Processing Summary
+                    <lightning-badge label={processStatus.Status__c} class="slds-m-left_small"></lightning-badge>
+                </h3>
+
+                <template if:true={isProcessingInFlight}>
+                    <div class="slds-m-bottom_small">
+                        <p class="slds-text-body_small slds-m-bottom_x-small">
+                            {processedCount} of {processStatus.Total_Quotes__c} Quotes processed - this can take a few minutes for larger files.
+                            You can safely close this page; processing continues, and reopening it will resume showing progress.
+                        </p>
+                        <lightning-progress-bar value={progressPercent} size="medium"></lightning-progress-bar>
+                    </div>
+                </template>
+
+                <lightning-layout multiple-rows="true">
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium">{processStatus.Total_Quotes__c}</p>
+                            <p class="slds-text-body_small">Total Quotes</p>
+                        </div>
+                    </lightning-layout-item>
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium slds-text-color_success">{processStatus.Successful_Quotes__c}</p>
+                            <p class="slds-text-body_small">Successful Quotes</p>
+                        </div>
+                    </lightning-layout-item>
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium slds-text-color_error">{processStatus.Failed_Quotes__c}</p>
+                            <p class="slds-text-body_small">Failed Quotes</p>
+                        </div>
+                    </lightning-layout-item>
+                    <lightning-layout-item size="3" padding="around-small">
+                        <div class="slds-text-align_center">
+                            <p class="slds-text-heading_medium">{processStatus.Total_Quote_Lines__c}</p>
+                            <p class="slds-text-body_small">Total Quote Lines</p>
+                        </div>
+                    </lightning-layout-item>
+                </lightning-layout>
+
+                <div class="slds-m-top_medium">
+                    <template if:true={hasAnyFailures}>
+                        <lightning-button
+                            label="Download Error Report"
+                            variant="destructive-text"
+                            icon-name="utility:download"
+                            disabled={isDownloading}
+                            onclick={downloadErrorReport}
+                            class="slds-m-right_small">
+                        </lightning-button>
+                    </template>
+                    <template if:true={isTerminalStatus}>
+                        <lightning-button
+                            label="Upload Another File"
+                            variant="neutral"
+                            onclick={resetForNewUpload}>
+                        </lightning-button>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+    </lightning-card>
+
+</template>
